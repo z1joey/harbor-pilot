@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Validate harbor.toml configs the way Harbor's Swift parser does, plus
+cross-project port-overlap checks.
+
+Usage:
+    python3 validate_harbor_toml.py PROJECT/harbor.toml [OTHER/harbor.toml ...]
+
+Exit codes: 0 = ok, 1 = problems found, 2 = cannot run (missing TOML lib).
+
+This script never spawns processes; live listening ports are checked
+separately with `lsof -nP -iTCP -sTCP:LISTEN +c0` (see SKILL.md).
+"""
+
+import os
+import re
+import sys
+
+PORT_MIN, PORT_MAX = 1, 65535
+PORT_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# user:pass@localhost in env often means docker-compose was copied into harbor.toml.
+DOCKERISH_LOCAL_DB_RE = re.compile(
+    r"^[^:]+://[^:]+:[^@]+@(?:localhost|127\.0\.0\.1)(?::\d+)?/", re.IGNORECASE
+)
+
+
+def load_toml(path):
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib  # type: ignore
+        except ModuleNotFoundError:
+            print("ERROR: need tomllib (Python 3.11+) or tomli:")
+            print("  uv run --with tomli python3 validate_harbor_toml.py ...")
+            sys.exit(2)
+    with open(path, "rb") as fh:
+        return tomllib.load(fh)
+
+
+def is_str(value):
+    return isinstance(value, str)
+
+
+def check_process(path, index, entry, errors):
+    label = f"process[{index}]"
+    name = entry.get("name")
+    if not is_str(name) or not name.strip():
+        errors.append(f"{path}: {label} needs a non-empty string \"name\".")
+        return None
+    label = f"process[{index}] (\"{name}\")"
+
+    command = entry.get("command")
+    if not is_str(command) or not command.strip():
+        errors.append(f"{path}: {label} needs a non-empty string \"command\".")
+
+    port = entry.get("port")
+    auto_port = False
+    if port is not None:
+        if isinstance(port, int) and not isinstance(port, bool):
+            if not PORT_MIN <= port <= PORT_MAX:
+                errors.append(f"{path}: {label} port must be an integer in {PORT_MIN}-{PORT_MAX}.")
+        elif is_str(port) and port == "auto":
+            auto_port = True
+            port = None
+        elif is_str(port):
+            errors.append(f"{path}: {label} port must be an integer or \"auto\", not {port!r}.")
+        else:
+            errors.append(f"{path}: {label} port must be an integer or \"auto\".")
+
+    port_env = entry.get("port_env")
+    if port_env is not None:
+        if not auto_port:
+            errors.append(f"{path}: {label} port_env is only allowed when port = \"auto\".")
+        elif not is_str(port_env) or not port_env.strip():
+            errors.append(f"{path}: {label} port_env must be a non-empty string.")
+        elif not PORT_ENV_RE.match(port_env):
+            errors.append(f"{path}: {label} port_env {port_env!r} is not a valid environment variable name.")
+    elif "port_env" in entry:
+        errors.append(f"{path}: {label} port_env must be a string.")
+
+    ready_url = entry.get("ready_url")
+    if ready_url is not None:
+        if not is_str(ready_url):
+            errors.append(f"{path}: {label} ready_url must be a string.")
+        else:
+            if "${port}" in ready_url and not auto_port:
+                errors.append(
+                    f"{path}: {label} ready_url uses ${{port}} but port is not \"auto\"."
+                )
+            validate_url = ready_url.replace("${port}", "1")
+            if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", validate_url):
+                errors.append(f"{path}: {label} ready_url {ready_url!r} must be a URL with a scheme.")
+
+    if auto_port and is_str(command):
+        env_name = port_env if is_str(port_env) and port_env else "PORT"
+        if f"${env_name}" not in command and f"${{{env_name}}}" not in command:
+            print(f"WARN     {path}: {label} port = \"auto\" but command does not reference ${env_name}.")
+
+    if "auto_restart" in entry and not isinstance(entry["auto_restart"], bool):
+        errors.append(f"{path}: {label} auto_restart must be a boolean.")
+
+    env = entry.get("env")
+    if env is not None:
+        if not isinstance(env, dict):
+            errors.append(f"{path}: {label} env must be a table.")
+        else:
+            for key, value in env.items():
+                if not isinstance(value, (str, int, bool)):
+                    errors.append(f"{path}: {label} env {key!r} must be a string, int, or boolean.")
+
+    return name, port
+
+
+def backend_default_database_url(project_root):
+    """Best-effort read of Settings.database_url default in backend/app/core/config.py."""
+    config_py = os.path.join(project_root, "backend", "app", "core", "config.py")
+    if not os.path.isfile(config_py):
+        return None
+    try:
+        with open(config_py, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    match = re.search(r'database_url:\s*str\s*=\s*"([^"]+)"', text)
+    return match.group(1) if match else None
+
+
+def has_docker_compose_process(data):
+    processes = data.get("process", [])
+    if not isinstance(processes, list):
+        return False
+    for entry in processes:
+        if not isinstance(entry, dict):
+            continue
+        command = entry.get("command")
+        if is_str(command) and "docker compose" in command:
+            return True
+    return False
+
+
+def check_env_drift(path, data, warnings):
+    """Warn when harbor.toml env copies Docker credentials but the app defaults to local dev."""
+    project_root = os.path.dirname(os.path.abspath(path))
+    processes = data.get("process", [])
+    if not isinstance(processes, list):
+        return
+    docker_db = has_docker_compose_process(data)
+    default_url = backend_default_database_url(project_root)
+    for index, entry in enumerate(processes):
+        if not isinstance(entry, dict):
+            continue
+        env = entry.get("env")
+        if not isinstance(env, dict):
+            continue
+        proc_name = entry.get("name") if is_str(entry.get("name")) else f"process[{index}]"
+        for key in ("STEWARDS_DATABASE_URL", "DATABASE_URL"):
+            if key not in env:
+                continue
+            url = str(env[key])
+            if DOCKERISH_LOCAL_DB_RE.match(url) and not docker_db:
+                hint = (
+                    f"{path}: {proc_name} env {key} looks Docker-specific ({url!r}). "
+                    "Harbor runs on the host — use the same URL as scripts/dev or "
+                    "backend/app/core/config.py (often peer auth, no user:pass on localhost), "
+                    "or add a `docker compose up …` process and match compose credentials."
+                )
+                if default_url and url != default_url:
+                    hint += f" App default: {default_url!r}."
+                warnings.append(hint)
+            elif default_url and url != default_url and not docker_db:
+                warnings.append(
+                    f"{path}: {proc_name} env {key} ({url!r}) differs from "
+                    f"backend default {default_url!r} — confirm this is intentional for Harbor."
+                )
+
+
+def check_claim(path, index, entry, process_names, taken_ports, errors):
+    label = f"port_claim[{index}]"
+    port = entry.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not PORT_MIN <= port <= PORT_MAX:
+        errors.append(f"{path}: {label} needs an integer \"port\" in {PORT_MIN}-{PORT_MAX}.")
+        return None
+    if port in taken_ports:
+        errors.append(f"{path}: {label} port {port} is already declared in this config.")
+    note = entry.get("note")
+    if note is not None and not is_str(note):
+        errors.append(f"{path}: {label} note must be a string.")
+    owner = entry.get("process")
+    if owner is not None and (not is_str(owner) or owner not in process_names):
+        errors.append(f"{path}: {label} process {owner!r} is not defined in this config.")
+    return port
+
+
+def check_file(path):
+    """Returns (project_name, claimed_ports:set, errors:list, warnings:list)."""
+    errors = []
+    warnings = []
+    try:
+        data = load_toml(path)
+    except Exception as exc:  # tomllib errors carry line/col info
+        return None, set(), [f"{path}: TOML parse error: {exc}"], warnings
+
+    if not isinstance(data, dict):
+        return None, set(), [f"{path}: top level must be a table."], warnings
+
+    check_env_drift(path, data, warnings)
+
+    processes = data.get("process", [])
+    if not isinstance(processes, list):
+        return data.get("name"), set(), [f"{path}: \"process\" must be a list of tables ([[process]])."], warnings
+
+    names, taken_ports = set(), set()
+    for index, entry in enumerate(processes):
+        if not isinstance(entry, dict):
+            errors.append(f"{path}: process[{index}] is not a table.")
+            continue
+        parsed = check_process(path, index, entry, errors)
+        if parsed is None:
+            continue
+        name, port = parsed
+        if name in names:
+            errors.append(f"{path}: duplicate process name \"{name}\".")
+        names.add(name)
+        if port is not None:
+            if port in taken_ports:
+                errors.append(f"{path}: port {port} is declared by two processes.")
+            taken_ports.add(port)
+
+    claims = data.get("port_claim", [])
+    if not isinstance(claims, list):
+        errors.append(f"{path}: \"port_claim\" must be a list of tables ([[port_claim]]).")
+        claims = []
+    for index, entry in enumerate(claims):
+        if not isinstance(entry, dict):
+            errors.append(f"{path}: port_claim[{index}] is not a table.")
+            continue
+        port = check_claim(path, index, entry, names, taken_ports, errors)
+        if port is not None:
+            taken_ports.add(port)
+
+    has_open_process = data.get("open_process") is not None
+    has_open_url = data.get("open_url") is not None
+    if has_open_process and has_open_url:
+        errors.append(f"{path}: use either open_process or open_url, not both.")
+    if has_open_process:
+        open_proc = data.get("open_process")
+        if not is_str(open_proc) or not open_proc.strip():
+            errors.append(f"{path}: open_process must be a non-empty string.")
+        elif open_proc not in names:
+            errors.append(f"{path}: open_process {open_proc!r} is not defined in this config.")
+    elif data.get("open_process") is not None:
+        errors.append(f"{path}: open_process must be a string.")
+    if has_open_url:
+        open_url = data.get("open_url")
+        if not is_str(open_url) or not open_url.strip():
+            errors.append(f"{path}: open_url must be a non-empty string.")
+        elif not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", open_url):
+            errors.append(f"{path}: open_url {open_url!r} must be a URL with a scheme.")
+    elif data.get("open_url") is not None:
+        errors.append(f"{path}: open_url must be a string.")
+
+    project_name = data.get("name")
+    return (project_name if is_str(project_name) and project_name else None), taken_ports, errors, warnings
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(2)
+
+    paths = sys.argv[1:]
+    results = [check_file(path) for path in paths]
+    errors = [error for _, _, errs, _ in results for error in errs]
+    warnings = [warn for _, _, _, warns in results for warn in warns]
+
+    # Cross-project static overlaps: same fixed port claimed by two configs.
+    by_port = {}
+    for (name, ports, _, _), path in zip(results, paths):
+        label = name or path
+        for port in ports:
+            by_port.setdefault(port, []).append(label)
+    overlaps = {port: holders for port, holders in by_port.items() if len(holders) > 1}
+    for port, holders in sorted(overlaps.items()):
+        print(f"OVERLAP  port {port} claimed by: {', '.join(holders)}")
+
+    for warning in warnings:
+        print(f"WARN     {warning}")
+
+    for error in errors:
+        print(f"ERROR    {error}")
+
+    if not errors and not overlaps:
+        print("OK       all checks passed"
+              + (f" ({len(results)} config(s))" if len(results) > 1 else ""))
+    sys.exit(1 if errors else 0)
+
+
+if __name__ == "__main__":
+    main()
