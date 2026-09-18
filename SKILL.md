@@ -1,15 +1,31 @@
 ---
-name: harbor-toml
-description: Generate and validate harbor.toml configs for Harbor, the macOS menubar dev-process manager. Use whenever the user wants to add/register a project to Harbor, create or fix a harbor.toml or .harbor.toml, declare processes/ports/port claims, or asks about avoiding port conflicts between their local projects while configuring one — even if they just say "接入 harbor"、"写个 harbor 配置"、"把这个项目加到 Harbor".
+name: harbor-pilot
+description: Assign sticky dev-server ports, generate and validate harbor.toml configs, and register projects into ~/.harbor — fully standalone, with or without the Harbor app running. Use whenever the user wants to add/register a project to Harbor, create or fix a harbor.toml or .harbor.toml, declare processes/ports/port claims, or asks about avoiding port conflicts between their local projects while configuring one — even if they just say "接入 harbor"、"写个 harbor 配置"、"把这个项目加到 Harbor".
 ---
 
-# Harbor: generate harbor.toml
+# Harbor Pilot: assign ports, write & register harbor.toml
 
-Harbor is a macOS menubar app that supervises per-project dev processes
-declared in a `harbor.toml` (or `.harbor.toml`) at the project root. This
-skill produces configs the real parser accepts (Harbor **1.1.0**), and
-**registers** sticky ports from Harbor's port pool so multiple projects
-don't collide.
+Harbor Pilot is a **standalone agent skill** for planning dev-server ports
+and registering projects in Harbor's convention. It produces configs the
+real Harbor parser accepts (Harbor **1.2.0**), hands out sticky ports from
+the port pool so multiple projects don't collide, and **registers the
+project** by writing Harbor's registry itself.
+
+**No app required.** The Harbor menubar app and `harbor-tui` are optional
+consumers: they only read (and watch) the same files. Everything this skill
+does — port planning, validation, registration — works with no Harbor
+process running, and `register_project.py` creates `~/.harbor` on demand
+(pool defaults to 8100–8199, registry starts empty).
+
+Harbor's on-disk state is the hidden `~/.harbor` folder:
+
+```
+~/.harbor/projects.json    # JSON array of registered project roots (this skill writes it)
+~/.harbor/port-pool.json   # { "ranges": [{ "from": 8100, "to": 8199 }] } (skill reads only)
+```
+
+Pre-1.2 stores under `~/Library/Application Support/Harbor/` are honored by
+reads and migrated into `~/.harbor` automatically on first registration.
 
 ## Workflow
 
@@ -34,9 +50,12 @@ don't collide.
    and fix everything it reports. Passing the other projects' configs lets it
    catch cross-project port overlaps too. Use
    `scripts/next_pool_port.py` (below) instead of reimplementing the scan.
-6. **Tell the user how to register**: Harbor app → main window →
-   "Add Project…" → pick the folder. Harbor watches the file, so later edits
-   hot-reload. Do not rewrite `projects.json` or `port-pool.json`.
+6. **Register**: after the TOML is saved in the project root, run
+   `python3 <this-skill-dir>/scripts/register_project.py <project-root>`.
+   It appends the root to `~/.harbor/projects.json` (idempotent, atomic,
+   requires the config to exist first). A running Harbor shows the project
+   within a second — there is no "Add Project…" step anymore; with no
+   frontend running it appears at next launch.
 
 ## Schema (parser-exact)
 
@@ -88,8 +107,8 @@ error banner and zero processes):
   `port`), and `process` must reference a defined process. Claims are **not**
   pool leases; leave typical DB/broker ports here.
 - Two projects claiming the same **fixed** port is legal TOML but creates a
-  *static overlap*: Harbor warns when adding the project, again at start
-  time, and flags it in Port Allocation Convention. Plan ports to avoid it.
+  *static overlap*: Harbor warns at start time and flags it in Port
+  Allocation Convention. Plan ports to avoid it.
 - `open_process` / `open_url`: optional, mutually exclusive. Enables the
   menubar safari button and main-window **Open in Browser** for the whole
   project. Prefer `open_process` for full-stack apps (e.g. `open_process =
@@ -154,8 +173,7 @@ move `--port $PORT` into a committed npm script, add a default there
 
 ## Port planning
 
-1. **Pool** — read
-   `~/Library/Application Support/Harbor/port-pool.json`. If the file is
+1. **Pool** — read `~/.harbor/port-pool.json`. If the file is
    missing, use **8100–8199**. Shape:
 
    ```json
@@ -164,10 +182,12 @@ move `--port $PORT` into a committed npm script, add a default there
 
    One or more inclusive ranges; Harbor rejects inverted, overlapping, or
    out-of-`1…65535` ranges. Users edit this in **Port Allocation
-   Convention**; the skill only reads it.
+   Convention**; the skill only reads it. (Pre-1.2 Harbor kept the file in
+   `~/Library/Application Support/Harbor/` — the scripts fall back to that
+   path while only it exists.)
 
 2. **Taken** — registered projects:
-   `~/Library/Application Support/Harbor/projects.json` (a JSON array of
+   `~/.harbor/projects.json` (a JSON array of
    absolute paths). Read each path's `harbor.toml` / `.harbor.toml` and
    collect every process `port` and `port_claim` port. Optionally treat
    live listeners as taken too:
@@ -269,3 +289,12 @@ Notes:
   outside the pool). `web` uses a **pool** port so multiple Vite projects
   don't collide on 5173; substitute `8100` with whatever
   `next_pool_port.py` prints.
+
+## Registering / unregistering
+
+- Register: `python3 <this-skill-dir>/scripts/register_project.py <root>`
+  (idempotent; requires the `harbor.toml` to exist first; the app watches the
+  registry and shows the project immediately).
+- Unregister or fix a stale path: edit `~/.harbor/projects.json` directly
+  (a JSON array of absolute roots) — Harbor hot-reloads it. Removing an
+  entry never deletes anything on disk.
