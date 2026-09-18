@@ -7,8 +7,9 @@ description: Generate and validate harbor.toml configs for Harbor, the macOS men
 
 Harbor is a macOS menubar app that supervises per-project dev processes
 declared in a `harbor.toml` (or `.harbor.toml`) at the project root. This
-skill produces configs the real parser accepts, with ports planned so that
-multiple projects don't collide.
+skill produces configs the real parser accepts (Harbor **1.1.0**), and
+**registers** sticky ports from Harbor's port pool so multiple projects
+don't collide.
 
 ## Workflow
 
@@ -17,20 +18,25 @@ multiple projects don't collide.
    configs (`vite.config.*`, `application.yml`, `settings.py`, …). Only ask
    the user about what you cannot discover this way.
 2. **Collect ports already claimed** by other Harbor projects (see *Port
-   planning* below). Never hand out a fixed port that another project claims.
-3. **Choose auto vs fixed per process** using the table in *port vs
-   port_claim vs port = "auto"* below. Default to `port = "auto"` for
-   standalone dev servers nothing else connects to; use a **fixed** port when
-   another process, proxy (`vite.config` → `server.proxy`), or config file
-   references this port by number.
+   planning* below). Never hand out a port that another project already
+   declares.
+3. **Register from the pool** for each Harbor-managed server that does not
+   already have a hardcoded number elsewhere (vite proxy, `.env`, OAuth
+   redirect). Read `port-pool.json` (default **8100–8199** if missing), skip
+   taken ports, write sticky `port = N` with `$PORT` in `command` /
+   `${port}` in `ready_url`. If another config **hardcodes** a port, use
+   that integer even when it sits outside the pool, and flag mismatches.
+   `[[port_claim]]` is unchanged (deps stay outside the pool). Never write
+   `port = "auto"`.
 4. **Draft the config** following the schema below — exact key names matter.
 5. **Validate**: run
    `python3 <this-skill-dir>/scripts/validate_harbor_toml.py <draft.toml> <other-projects' *.toml ...>`
    and fix everything it reports. Passing the other projects' configs lets it
-   catch cross-project port overlaps too.
+   catch cross-project port overlaps too. Use
+   `scripts/next_pool_port.py` (below) instead of reimplementing the scan.
 6. **Tell the user how to register**: Harbor app → main window →
    "Add Project…" → pick the folder. Harbor watches the file, so later edits
-   hot-reload.
+   hot-reload. Do not rewrite `projects.json` or `port-pool.json`.
 
 ## Schema (parser-exact)
 
@@ -41,18 +47,17 @@ open_process = "web"             # optional; project "Open in Browser" target (m
 
 [[process]]                      # one block per managed process
 name = "api"                     # required; unique within the project
-command = "uv run uvicorn app.main:app --reload --port 8000"  # fixed port: hardcode N in command
+command = "uv run uvicorn app.main:app --reload --port $PORT"
 cwd = "backend"                  # optional; relative to project root
-port = 8000                      # optional: fixed int 1–65535, or "auto" (see below)
-ready_url = "http://127.0.0.1:8000/health"  # optional; use ${port} only with port = "auto"
-# Auto alternative: command = "... --port $PORT", port = "auto",
-# ready_url = "http://127.0.0.1:${port}/health", port_env = "PORT"
+port = 8100                      # optional: sticky integer 1–65535 (pool registration)
+ready_url = "http://127.0.0.1:${port}/health"  # optional; ${port} substitutes N
+# port_env = "PORT"              # optional env var name Harbor injects (default PORT)
 auto_restart = false             # optional; restart on unexpected exit (default false)
 env = { "FOO" = "bar", "RETRIES" = 3 }      # optional; int/bool coerced to strings
 
 [[port_claim]]
 port = 5432                      # required; 1–65535
-note = "postgres"                # optional; shown in the ports overview
+note = "postgres"                # optional; shown in Port Allocation Convention
 process = "deps"                 # optional; must match a [[process]] name above
 ```
 
@@ -62,57 +67,55 @@ error banner and zero processes):
 - Process `name`: required, non-empty, unique in the project.
 - `command`: required, non-empty, run as a foreground long-running process
   via a login shell (`/bin/zsh -lc`) — so `npm`, `uv`, `nvm` PATHs all work.
-- `port`: optional. Either a fixed integer (1–65535) or the string `"auto"`.
-  - **Fixed port** — conflict detection, browser link, and pre-start overlap
-    warnings use this number. Use when the app hardcodes its port in several
-    places and you want Harbor to plan around a known value.
-  - **`port = "auto"`** — Harbor picks a free port from **8100–9999** on
-    each start (nothing persisted; the number changes every run). Harbor
-    injects the chosen port as the `PORT` environment variable (override the
-    name with `port_env`). Reference it in `command` via `$PORT` or
-    `${PORT}`. Auto ports skip pre-start conflict checks; Harbor scans at
-    start time instead. Does not affect deployment — only applies to
-    processes Harbor spawns locally.
-- `port_env`: optional string, only allowed with `port = "auto"`. Must match
-  `[A-Za-z_][A-Za-z0-9_]*`. Default `PORT`. Harbor's assignment wins over
-  a conflicting value in `env`.
-- `ready_url`: optional URL with a scheme. May contain `${port}` **only**
-  when `port = "auto"` (substituted at start with the assigned port).
+- `port`: optional integer **1–65535**. `"auto"` is a parse error. The
+  number is a sticky lease Harbor injects at start as `port_env` (default
+  `PORT`); it does not change between runs.
+  - **Pool registration** — for Harbor-managed servers nothing else
+    hardcodes, pick the next free port from the pool and write `port = N`
+    with `$PORT` / `${PORT}` in `command`.
+  - **Hardcoded outside the pool** — legal. Use when vite proxy, `.env`,
+    OAuth redirects, or another process already pin a number (`5173`,
+    `8001`, …). Match those files; flag mismatches instead of silently
+    diverging.
+- `port_env`: optional string, allowed on any process that declares
+  `port`. Must match `[A-Za-z_][A-Za-z0-9_]*`. Default `PORT`. Harbor's
+  injected value wins over a conflicting key in `env`.
+- `ready_url`: optional URL with a scheme. May contain `${port}` whenever
+  `port` is declared (substituted with `N` at start).
 - `port_claim`: ports the project relies on without one owning process —
   databases, brokers, or a compose process exposing several ports. Same port
   must not appear twice in the project (claim vs claim, or claim vs process
-  `port`), and `process` must reference a defined process.
+  `port`), and `process` must reference a defined process. Claims are **not**
+  pool leases; leave typical DB/broker ports here.
 - Two projects claiming the same **fixed** port is legal TOML but creates a
   *static overlap*: Harbor warns when adding the project, again at start
-  time, and flags it in the Ports Overview. Plan ports to avoid it.
+  time, and flags it in Port Allocation Convention. Plan ports to avoid it.
 - `open_process` / `open_url`: optional, mutually exclusive. Enables the
   menubar safari button and main-window **Open in Browser** for the whole
   project. Prefer `open_process` for full-stack apps (e.g. `open_process =
   "frontend"`) so Harbor resolves `ready_url` or `http://127.0.0.1:<port>/`
-  with live auto-port assignment. Use `open_url` only for a fixed bookmark.
+  using the sticky port. Use `open_url` only for a fixed bookmark.
   Do not point at API health endpoints (`/health`) when the user expects the UI.
 
-## port vs port_claim vs port = "auto"
+## port vs port_claim vs pool registration
 
-- The process itself listens on a **known** port → fixed `port = N` on that
-  `[[process]]`.
-- The process should get a **free port each run** → `port = "auto"` and
-  `$PORT` in `command`. Best when two projects would otherwise share a
-  framework default (two Vite apps both on 5173).
+- Harbor-managed server, nothing else pins the number → **register** the
+  next free **pool** port on that `[[process]]` (`port = N` + `$PORT`).
+- Another config already hardcodes the number (proxy, `.env`, OAuth) →
+  fixed `port = N` matching that file, even outside the pool.
 - Something else in the project's stack uses it (containerized postgres,
-  redis, a second socket) → `[[port_claim]]`.
-
-When choosing auto vs fixed:
+  redis, a second socket) → `[[port_claim]]`. Unchanged; keep these
+  outside the pool.
 
 | Situation | Prefer |
 |---|---|
-| Two+ projects, same framework default | `port = "auto"` + `$PORT` in command |
-| Another process or proxy config references this port | Fixed `port = N` (e.g. Vite `server.proxy` → API on 8001) |
+| Two+ projects, same framework default | Pool registration + `$PORT` in command |
+| Another process or proxy config references this port | Fixed `port = N` matching that config (may be outside the pool) |
 | Port hardcoded in vite.config, compose, `.env`, etc. | Fixed `port = N` matching those files |
-| OAuth redirect URIs / bookmarks need a stable local port | Fixed `port = N` (auto changes every start) |
-| Server already reads `process.env.PORT` / `$PORT` | `port = "auto"` — minimal config change |
+| OAuth redirect URIs / bookmarks need a stable local port | Pool registration (`port = N` is sticky across restarts) |
+| Server already reads `process.env.PORT` / `$PORT` | Pool registration — Harbor injects `PORT=N` |
 
-## Automatic ports example
+## Pool registration example
 
 ```toml
 name = "my-api"
@@ -120,13 +123,17 @@ name = "my-api"
 [[process]]
 name = "api"
 command = "uv run uvicorn app.main:app --reload --port $PORT"
-port = "auto"
+port = 8100
 ready_url = "http://127.0.0.1:${port}/health"
 ```
 
+`8100` here is an example of the first default-pool port. **Do not copy it
+blindly** — run `next_pool_port.py` against sibling TOMLs so you get the
+next free number.
+
 Common command patterns:
 
-| Stack | command with auto port |
+| Stack | command with `$PORT` |
 |---|---|
 | uvicorn | `uv run uvicorn app.main:app --reload --port $PORT` |
 | python http.server | `python3 -m http.server $PORT` |
@@ -135,9 +142,10 @@ Common command patterns:
 | Rails | `bin/rails server -p $PORT` |
 | Node (reads env) | `npm run dev` (if script uses `process.env.PORT`) |
 
-Harbor shows a soft lint when `port = "auto"` but the command string does not
-reference `$PORT`. After ~5s it badges a mismatch if the process tree
-listens on a port other than the one Harbor assigned.
+Harbor shows a soft lint when `port` is set but the command string
+references neither `$PORT` / `${PORT}` (or `port_env`) nor the decimal `N`.
+After ~5s it badges a mismatch if the process tree listens on a port other
+than the one declared.
 
 **Deployment note:** Harbor only injects `PORT` into processes it spawns from
 `harbor.toml`. Production deploys (Docker, CI, PaaS) are unaffected. If you
@@ -146,21 +154,48 @@ move `--port $PORT` into a committed npm script, add a default there
 
 ## Port planning
 
-1. Registered projects: read
+1. **Pool** — read
+   `~/Library/Application Support/Harbor/port-pool.json`. If the file is
+   missing, use **8100–8199**. Shape:
+
+   ```json
+   { "ranges": [{ "from": 8100, "to": 8199 }] }
+   ```
+
+   One or more inclusive ranges; Harbor rejects inverted, overlapping, or
+   out-of-`1…65535` ranges. Users edit this in **Port Allocation
+   Convention**; the skill only reads it.
+
+2. **Taken** — registered projects:
    `~/Library/Application Support/Harbor/projects.json` (a JSON array of
    absolute paths). Read each path's `harbor.toml` / `.harbor.toml` and
-   collect every **fixed** process `port` and `port_claim` port — these are
-   taken. `port = "auto"` processes contribute no static claim.
-2. Ports listening right now: `lsof -nP -iTCP -sTCP:LISTEN +c0` — treat as
-   taken as well (some may belong to projects not yet registered).
-3. For fixed ports, suggest numbers from **8000–8099** first, then **10000+**,
-   skipping both sets — avoid **8100–9999** for fixed assignments (Harbor's
-   auto pool). Harbor's auto allocator scans 8100–9999 at start time.
-4. Remember: Harbor will not rewrite the app's own configs. If the project
-   hardcodes its port in five places (Dockerfile, compose, nginx, proxy,
-   dev script), either use `port = "auto"` **and** wire `$PORT` through
-   those entry points, or pick a fixed `port = N` that matches them — flag
-   any mismatch instead of silently diverging.
+   collect every process `port` and `port_claim` port. Optionally treat
+   live listeners as taken too:
+   `lsof -nP -iTCP -sTCP:LISTEN +c0`.
+
+3. **Register** — assign the first free pool port to each Harbor-managed
+   server that does not already have a hardcoded number elsewhere. Write
+   `port = N` and keep `$PORT` in `command` / `${port}` in `ready_url`.
+
+   Helper (does not need Harbor running):
+
+   ```bash
+   python3 <this-skill-dir>/scripts/next_pool_port.py --lsof \
+     --projects-json \
+     /path/to/other-project/harbor.toml
+   ```
+
+   Prints the next free pool port. Use `--count N` for several servers
+   (already-printed numbers are skipped). Extra taken ports can be piped
+   with `--stdin-taken` (one integer per line).
+
+4. If another config **hardcodes** a port, use that integer (even outside
+   the pool) and flag mismatches — Harbor will not rewrite the app's own
+   files (Dockerfile, compose, nginx, proxy, dev script).
+
+5. `[[port_claim]]` unchanged.
+
+Never write `port = "auto"`. The validator rejects it.
 
 ## Framework default ports (for discovery)
 
@@ -177,12 +212,17 @@ move `--port $PORT` into a committed npm script, add a default there
 | MongoDB | 27017 |
 
 Two dev servers of the same framework in different projects collide by
-default — use `port = "auto"` or renumber deliberately.
+default — register each from the pool (or renumber a hardcoded port
+deliberately when something else pins it).
 
 ## Complete example
 
 Full-stack project: Vite frontend, FastAPI backend, Postgres + Redis in
-Docker via compose:
+Docker via compose. `web` is a pool registration; `api` stays on **8001**
+because the frontend proxy hardcodes that number; DB/broker ports are
+claims.
+
+Same content lives in `examples/fullstack.toml`.
 
 ```toml
 name = "shop"
@@ -212,7 +252,8 @@ env = { "DATABASE_URL" = "postgres://localhost/shop" }
 name = "web"
 command = "npm run dev -- --port $PORT"
 cwd = "frontend"
-port = "auto"
+port = 8100
+ready_url = "http://127.0.0.1:${port}/"
 ```
 
 Notes:
@@ -224,5 +265,7 @@ Notes:
   project's committed config.
 - `api` stays on a **fixed** port because `frontend/vite.config` proxies to
   `http://127.0.0.1:8001` — Harbor has no cross-process port references, so
-  anything another process reaches by number must be fixed. `web` uses
-  `port = "auto"` so multiple Vite projects don't collide on 5173.
+  anything another process reaches by number must be fixed (and may sit
+  outside the pool). `web` uses a **pool** port so multiple Vite projects
+  don't collide on 5173; substitute `8100` with whatever
+  `next_pool_port.py` prints.
