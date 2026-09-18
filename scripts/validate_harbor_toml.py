@@ -22,10 +22,10 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from harbor_pool import (  # noqa: E402
-    DEFAULT_POOL_PATH,
     PORT_MAX,
     PORT_MIN,
     PoolError,
+    default_pool_path,
     load_port_pool,
     port_in_pool,
 )
@@ -319,7 +319,7 @@ def check_file(path, pool_ranges):
 
 
 def parse_cli(argv):
-    pool_path = DEFAULT_POOL_PATH
+    pool_path = default_pool_path()  # ~/.harbor, with legacy App Support fallback
     paths = []
     args = argv[1:]
     index = 0

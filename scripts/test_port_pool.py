@@ -10,6 +10,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS not in sys.path:
@@ -19,14 +20,17 @@ import harbor_pool  # noqa: E402
 from harbor_pool import (  # noqa: E402
     PoolError,
     claimed_ports_from_data,
+    migrate_legacy_stores,
     next_free_ports,
     parse_lsof_listen_ports,
     parse_pool_data,
     port_in_pool,
+    register_project,
 )
 
 NEXT_POOL = os.path.join(SCRIPTS, "next_pool_port.py")
 VALIDATE = os.path.join(SCRIPTS, "validate_harbor_toml.py")
+REGISTER = os.path.join(SCRIPTS, "register_project.py")
 
 
 def write(path, text):
@@ -113,6 +117,109 @@ class NextFreeTests(unittest.TestCase):
     def test_lsof_parse(self):
         text = "node 1 me  3u  IPv4  TCP *:8100 (LISTEN)\nnginx 2 me 4u TCP 127.0.0.1:5432 (LISTEN)\n"
         self.assertEqual(parse_lsof_listen_ports(text), {8100, 5432})
+
+
+class HarborHomeTests(unittest.TestCase):
+    """The ~/.harbor contract: paths, legacy fallback, migration, registration."""
+
+    def test_default_paths_point_at_harbor_home(self):
+        self.assertTrue(harbor_pool.HARBOR_DIR.endswith("/.harbor"))
+        self.assertEqual(harbor_pool.DEFAULT_POOL_PATH, os.path.join(harbor_pool.HARBOR_DIR, "port-pool.json"))
+        self.assertEqual(harbor_pool.DEFAULT_PROJECTS_JSON, os.path.join(harbor_pool.HARBOR_DIR, "projects.json"))
+
+    def test_fallback_to_legacy_while_only_legacy_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            new_dir = os.path.join(tmp, "new")
+            legacy_dir = os.path.join(tmp, "legacy")
+            os.makedirs(legacy_dir)
+            write(os.path.join(legacy_dir, "port-pool.json"), '{"ranges": [{"from": 8200, "to": 8299}]}')
+            write(os.path.join(legacy_dir, "projects.json"), "[]")
+            with unittest.mock.patch.object(harbor_pool, "HARBOR_DIR", new_dir), \
+                 unittest.mock.patch.object(harbor_pool, "DEFAULT_POOL_PATH", os.path.join(new_dir, "port-pool.json")), \
+                 unittest.mock.patch.object(harbor_pool, "DEFAULT_PROJECTS_JSON", os.path.join(new_dir, "projects.json")), \
+                 unittest.mock.patch.object(harbor_pool, "LEGACY_DIR", legacy_dir), \
+                 unittest.mock.patch.object(harbor_pool, "LEGACY_POOL_PATH", os.path.join(legacy_dir, "port-pool.json")), \
+                 unittest.mock.patch.object(harbor_pool, "LEGACY_PROJECTS_JSON", os.path.join(legacy_dir, "projects.json")):
+                self.assertEqual(harbor_pool.default_pool_path(), os.path.join(legacy_dir, "port-pool.json"))
+                self.assertEqual(harbor_pool.default_projects_path(), os.path.join(legacy_dir, "projects.json"))
+                os.makedirs(new_dir)
+                write(os.path.join(new_dir, "projects.json"), "[]")
+                self.assertEqual(harbor_pool.default_projects_path(), os.path.join(new_dir, "projects.json"))
+
+    def test_migrate_moves_stores_and_cleans_legacy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            harbor_dir = os.path.join(tmp, ".harbor")
+            legacy_dir = os.path.join(tmp, "legacy")
+            os.makedirs(legacy_dir)
+            write(os.path.join(legacy_dir, "projects.json"), '["/tmp/a"]')
+            write(os.path.join(legacy_dir, "port-pool.json"), "{}")
+            write(os.path.join(legacy_dir, "projects.json.lock"), "")
+            migrate_legacy_stores(harbor_dir=harbor_dir, legacy_dir=legacy_dir)
+            self.assertTrue(os.path.isfile(os.path.join(harbor_dir, "projects.json")))
+            self.assertTrue(os.path.isfile(os.path.join(harbor_dir, "port-pool.json")))
+            self.assertFalse(os.path.isdir(legacy_dir))
+
+    def test_migrate_keeps_existing_harbor_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            harbor_dir = os.path.join(tmp, ".harbor")
+            legacy_dir = os.path.join(tmp, "legacy")
+            os.makedirs(harbor_dir)
+            os.makedirs(legacy_dir)
+            write(os.path.join(harbor_dir, "projects.json"), '["/fresh"]')
+            write(os.path.join(legacy_dir, "projects.json"), '["/old"]')
+            migrate_legacy_stores(harbor_dir=harbor_dir, legacy_dir=legacy_dir)
+            with open(os.path.join(harbor_dir, "projects.json"), encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), ["/fresh"])
+
+
+class RegisterProjectTests(unittest.TestCase):
+    def make_project(self, tmp, name="web"):
+        project = os.path.join(tmp, name)
+        write(os.path.join(project, "harbor.toml"), SAMPLE_PROCESS.format(name=name, port=8100))
+        return project
+
+    def test_registers_into_explicit_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self.make_project(tmp)
+            registry = os.path.join(tmp, ".harbor", "projects.json")
+            self.assertEqual(register_project(project, projects_path=registry), "registered")
+            with open(registry, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), [project])
+
+    def test_registration_is_idempotent_and_normalizes_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self.make_project(tmp)
+            registry = write(os.path.join(tmp, "projects.json"), json.dumps([project + "/"]))
+            self.assertEqual(register_project(project, projects_path=registry), "already-registered")
+            with open(registry, encoding="utf-8") as fh:
+                # No-op registration leaves the skill-owned file untouched.
+                self.assertEqual(json.load(fh), [project + "/"])
+
+    def test_registration_requires_config_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = os.path.join(tmp, "empty")
+            os.makedirs(empty)
+            with self.assertRaises(PoolError):
+                register_project(empty, projects_path=os.path.join(tmp, "projects.json"))
+
+    def test_registration_rejects_traversal_and_relative_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = os.path.join(tmp, "projects.json")
+            with self.assertRaises(PoolError):
+                register_project(os.path.join(tmp, "a", "..", "b"), projects_path=registry)
+            with self.assertRaises(PoolError):
+                register_project("relative/path", projects_path=registry)
+
+    def test_register_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self.make_project(tmp, name="cli")
+            registry = os.path.join(tmp, "projects.json")
+            result = run_script(REGISTER, [project, "--projects-json-path", registry])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("REGISTERED", result.stdout)
+            again = run_script(REGISTER, [project, "--projects-json-path", registry])
+            self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertIn("ALREADY-REGISTERED", again.stdout)
 
 
 class ScriptTests(unittest.TestCase):

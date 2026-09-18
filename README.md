@@ -1,8 +1,8 @@
 # harbor-toml
 
-Cursor agent skill for [Harbor](https://github.com/z1joey/harbor) **1.1.0** — drafts and validates `harbor.toml` configs from your repo layout, **registers sticky ports from Harbor's port pool**, plans claims across registered projects, and catches schema mistakes before you add a folder in the app.
+Cursor agent skill for [Harbor](https://github.com/z1joey/harbor) **1.2.0** — drafts and validates `harbor.toml` configs from your repo layout, **registers sticky ports from Harbor's port pool**, plans claims across registered projects, and **registers the project in Harbor's registry** (`~/.harbor`).
 
-Harbor 1.1.0 removed `port = "auto"`. Managed servers get a durable `port = N` from the pool (`~/Library/Application Support/Harbor/port-pool.json`, default **8100–8199**). Harbor injects `$PORT` at start; the skill picks the number.
+Harbor 1.2.0 stores its state in the hidden `~/.harbor` folder (`projects.json` + `port-pool.json`); the app only reads and watches those files, so this skill works whether or not Harbor is running. Managed servers get a durable `port = N` from the pool (default **8100–8199**); Harbor injects `$PORT` at start; the skill picks the number.
 
 ## Install
 
@@ -22,7 +22,15 @@ python3 ~/.agents/skills/harbor-toml/scripts/next_pool_port.py \
   path/to/other-project/harbor.toml
 ```
 
-Prints the next free port in the configured pool, skipping process `port` and `port_claim` values in the given TOMLs (and, with `--projects-json`, every project listed in `~/Library/Application Support/Harbor/projects.json`). `--count N` prints N ports. Missing pool file → 8100–8199.
+Prints the next free port in the configured pool, skipping process `port` and `port_claim` values in the given TOMLs (and, with `--projects-json`, every project listed in `~/.harbor/projects.json`). `--count N` prints N ports. Missing pool file → 8100–8199.
+
+## Register a project
+
+```bash
+python3 ~/.agents/skills/harbor-toml/scripts/register_project.py ~/Projects/my-app
+```
+
+Appends the folder to `~/.harbor/projects.json` (idempotent, atomic) after checking a `harbor.toml` exists there. A running Harbor app/TUI picks the project up within a second; no in-app "Add Project" step exists anymore.
 
 ## Validate without the app
 
@@ -43,7 +51,9 @@ Pass every registered project's config to catch static port overlaps. Exit `0` =
 | `SKILL.md` | Full workflow, schema, pool-registration SOP for the agent |
 | `examples/fullstack.toml` | Full-stack sample: pool `web` + hardcoded `api` + DB claims |
 | `scripts/next_pool_port.py` | Pool file + sibling TOMLs → next free port |
-| `scripts/harbor_pool.py` | Shared pool JSON + claimed-port helpers |
+| `scripts/register_project.py` | Append a project root to `~/.harbor/projects.json` |
+| `scripts/harbor_pool.py` | Shared pool JSON + claimed-port + registry helpers |
 | `scripts/validate_harbor_toml.py` | Parser-aligned validator + overlap checks + pool warnings |
+| `scripts/test_port_pool.py` | Unit + CLI tests for all of the above |
 
-The skill writes `harbor.toml` on disk only — register the folder in Harbor via **Add Project…** after saving. Do not rewrite `projects.json` or `port-pool.json`.
+The skill writes `harbor.toml` in the project and `~/.harbor/projects.json` for registration; it never touches `port-pool.json` (users edit that in the app). Pre-1.2 stores under `~/Library/Application Support/Harbor/` are migrated automatically on first registration (and by the app at launch).

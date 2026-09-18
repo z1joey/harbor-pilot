@@ -1,13 +1,18 @@
-"""Harbor 1.1.0 port-pool helpers shared by next_pool_port.py and the validator.
+"""Harbor 1.2.0 port-pool helpers shared by next_pool_port.py, the validator,
+and register_project.py.
 
-Pool file (beside projects.json):
+Harbor's on-disk state lives in the hidden `~/.harbor` folder:
 
-    ~/Library/Application Support/Harbor/port-pool.json
+    ~/.harbor/projects.json    # JSON array of registered project roots
+    ~/.harbor/port-pool.json   # { "ranges": [{ "from": 8100, "to": 8199 }] }
 
-    { "ranges": [{ "from": 8100, "to": 8199 }] }
+Missing pool file → default 8100–8199. Present file must have one or more
+inclusive ranges in 1…65535; inverted or overlapping ranges are rejected.
 
-Missing file → default 8100–8199. Present file must have one or more inclusive
-ranges in 1…65535; inverted or overlapping ranges are rejected.
+The skill can register projects while no Harbor app is running: the app only
+reads (and watches) the same files. Pre-1.2 stores under
+"~/Library/Application Support/Harbor" are migrated on first registration and
+still honored by reads until then.
 """
 
 from __future__ import annotations
@@ -18,18 +23,74 @@ import re
 
 PORT_MIN, PORT_MAX = 1, 65535
 DEFAULT_RANGES = ((8100, 8199),)
-DEFAULT_POOL_PATH = os.path.expanduser(
-    "~/Library/Application Support/Harbor/port-pool.json"
-)
-DEFAULT_PROJECTS_JSON = os.path.expanduser(
-    "~/Library/Application Support/Harbor/projects.json"
-)
+HARBOR_DIR = os.path.expanduser("~/.harbor")
+DEFAULT_POOL_PATH = os.path.join(HARBOR_DIR, "port-pool.json")
+DEFAULT_PROJECTS_JSON = os.path.join(HARBOR_DIR, "projects.json")
+
+LEGACY_DIR = os.path.expanduser("~/Library/Application Support/Harbor")
+LEGACY_POOL_PATH = os.path.join(LEGACY_DIR, "port-pool.json")
+LEGACY_PROJECTS_JSON = os.path.join(LEGACY_DIR, "projects.json")
+
 CONFIG_NAMES = ("harbor.toml", ".harbor.toml")
 LSOF_LISTEN_RE = re.compile(r":(\d+)\s+\(LISTEN\)")
 
 
 class PoolError(Exception):
-    """Invalid port-pool.json or exhausted pool."""
+    """Invalid port-pool.json / projects.json, or exhausted pool."""
+
+
+def _validated_abspath(path, label):
+    """Expanduser + reject relative paths and '..' segments (no traversal)."""
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded):
+        raise PoolError(f"{label} must be an absolute path: {path}")
+    if ".." in expanded.split(os.sep):
+        raise PoolError(f"{label} must not contain '..' segments: {path}")
+    return os.path.normpath(expanded)
+
+
+def default_pool_path():
+    """~/.harbor/port-pool.json, or the legacy App Support file while only that exists."""
+    if not os.path.isfile(DEFAULT_POOL_PATH) and os.path.isfile(LEGACY_POOL_PATH):
+        return LEGACY_POOL_PATH
+    return DEFAULT_POOL_PATH
+
+
+def default_projects_path():
+    """~/.harbor/projects.json, or the legacy App Support file while only that exists."""
+    if not os.path.isfile(DEFAULT_PROJECTS_JSON) and os.path.isfile(LEGACY_PROJECTS_JSON):
+        return LEGACY_PROJECTS_JSON
+    return DEFAULT_PROJECTS_JSON
+
+
+def migrate_legacy_stores(harbor_dir=HARBOR_DIR, legacy_dir=LEGACY_DIR):
+    """One-time move of the pre-1.2 App Support stores into ~/.harbor.
+
+    Files already in ~/.harbor win; a Harbor app racing us to the same move
+    makes one side a silent no-op. Never raises for valid directories.
+    """
+    harbor_dir = _validated_abspath(harbor_dir, "harbor directory")
+    legacy_dir = _validated_abspath(legacy_dir, "legacy directory")
+    try:
+        os.makedirs(harbor_dir, exist_ok=True)
+        if not os.path.isdir(legacy_dir):
+            return
+        for name in ("projects.json", "port-pool.json"):
+            src = os.path.join(legacy_dir, name)
+            dst = os.path.join(harbor_dir, name)
+            if os.path.isfile(src) and not os.path.exists(dst):
+                os.replace(src, dst)
+        for name in ("projects.json.lock", "port-pool.json.lock"):
+            try:
+                os.remove(os.path.join(legacy_dir, name))
+            except OSError:
+                pass
+        try:
+            os.rmdir(legacy_dir)  # succeeds only when the directory is empty
+        except OSError:
+            pass
+    except OSError:
+        pass
 
 
 def load_toml(path):
@@ -80,7 +141,7 @@ def parse_pool_data(data):
 
 def load_port_pool(path=None, missing_ok=True):
     """Load inclusive pool ranges. Missing file → default 8100–8199 when missing_ok."""
-    pool_path = DEFAULT_POOL_PATH if path is None else path
+    pool_path = default_pool_path() if path is None else path
     if not os.path.isfile(pool_path):
         if missing_ok:
             return list(DEFAULT_RANGES)
@@ -168,7 +229,7 @@ def resolve_toml_arg(path):
 
 def configs_from_projects_json(path=None):
     """Return harbor.toml paths for every root listed in projects.json."""
-    registry = DEFAULT_PROJECTS_JSON if path is None else path
+    registry = default_projects_path() if path is None else path
     if not os.path.isfile(registry):
         return []
     with open(registry, encoding="utf-8") as fh:
@@ -219,3 +280,58 @@ def parse_taken_ports_text(text):
             raise PoolError(f"stdin taken-port {port} is out of range.")
         taken.add(port)
     return taken
+
+
+def register_project(root, projects_path=None):
+    """Append a project root to ~/.harbor/projects.json — the file Harbor reads.
+
+    Register only after the config exists (both flavors are detected). The
+    write is idempotent and atomic, so a running Harbor app picks it up via
+    its directory watcher. Returns "registered" or "already-registered".
+    """
+    root = _validated_abspath(root, "project root")
+    if not os.path.isdir(root):
+        raise PoolError(f"not a directory: {root}")
+    if locate_config(root) is None:
+        raise PoolError(
+            f"no harbor.toml or .harbor.toml in {root} — write the config before registering"
+        )
+    if projects_path is None:
+        migrate_legacy_stores()
+        projects_path = DEFAULT_PROJECTS_JSON
+    else:
+        projects_path = _validated_abspath(projects_path, "projects.json path")
+    try:
+        with open(projects_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        data = []
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PoolError(f"could not read {projects_path}: {exc}") from exc
+    if not isinstance(data, list):
+        raise PoolError(f"{projects_path} must be a JSON array of project root paths.")
+    data = [
+        os.path.normpath(os.path.expanduser(entry)) if isinstance(entry, str) else entry
+        for entry in data
+    ]
+    if root in data:
+        return "already-registered"
+    data.append(root)
+
+    import tempfile
+    directory = os.path.dirname(projects_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".projects-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, projects_path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return "registered"

@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Print the next free Harbor pool port (Harbor 1.1.0).
+"""Print the next free Harbor pool port.
 
 Usage:
     python3 next_pool_port.py [--pool PATH] [--count N] [--lsof]
                               [--projects-json] [--projects-json-path PATH]
                               [--stdin-taken] [TOML-or-project-dir ...]
 
-Reads the pool from port-pool.json (default:
-~/Library/Application Support/Harbor/port-pool.json). If that file is
-missing, uses 8100–8199. Skips ports claimed by the given harbor.toml
-files (process port + port_claim). Directories are resolved to
-harbor.toml / .harbor.toml.
+Reads the pool from ~/.harbor/port-pool.json (falling back to the legacy
+"~/Library/Application Support/Harbor/port-pool.json" while only that
+exists). If neither file exists, uses 8100–8199. Skips ports claimed by the
+given harbor.toml files (process port + port_claim). Directories are
+resolved to harbor.toml / .harbor.toml.
 
     --projects-json         also load every registered project's config
-                           from the default projects.json
+                           from ~/.harbor/projects.json
     --projects-json-path P  same, but from an explicit registry path
     --lsof                 treat current TCP listeners as taken
     --stdin-taken          read extra taken ports from stdin (one int per line)
@@ -33,11 +33,11 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from harbor_pool import (  # noqa: E402
-    DEFAULT_POOL_PATH,
-    DEFAULT_PROJECTS_JSON,
     PoolError,
     claimed_ports_from_toml,
     configs_from_projects_json,
+    default_pool_path,
+    default_projects_path,
     live_listen_ports,
     load_port_pool,
     next_free_ports,
@@ -48,15 +48,16 @@ from harbor_pool import (  # noqa: E402
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Print the next free Harbor 1.1.0 pool port.",
+        description="Print the next free Harbor pool port.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument(
         "--pool",
         metavar="PATH",
-        default=DEFAULT_POOL_PATH,
-        help="port-pool.json path (default: %(default)s; missing → 8100–8199)",
+        default=None,
+        help="port-pool.json path (default: ~/.harbor/port-pool.json with legacy "
+             "App Support fallback; missing → 8100–8199)",
     )
     parser.add_argument(
         "--count",
@@ -73,7 +74,7 @@ def build_parser():
     parser.add_argument(
         "--projects-json",
         action="store_true",
-        help=f"also load TOMLs listed in {DEFAULT_PROJECTS_JSON}",
+        help="also load TOMLs listed in ~/.harbor/projects.json",
     )
     parser.add_argument(
         "--projects-json-path",
@@ -125,8 +126,9 @@ def main(argv=None):
     try:
         registry = args.projects_json_path
         if registry is None and args.projects_json:
-            registry = DEFAULT_PROJECTS_JSON
-        ranges = load_port_pool(args.pool, missing_ok=True)
+            registry = default_projects_path()
+        pool = args.pool or default_pool_path()
+        ranges = load_port_pool(pool, missing_ok=True)
         taken = collect_taken(args.tomls, registry, args.lsof, args.stdin_taken)
         ports = next_free_ports(ranges, taken, count=args.count)
     except PoolError as exc:
