@@ -1,15 +1,21 @@
 ---
-name: harbor-toml
-description: Generate and validate harbor.toml configs for Harbor, the macOS menubar dev-process manager. Use whenever the user wants to add/register a project to Harbor, create or fix a harbor.toml or .harbor.toml, declare processes/ports/port claims, or asks about avoiding port conflicts between their local projects while configuring one — even if they just say "接入 harbor"、"写个 harbor 配置"、"把这个项目加到 Harbor".
+name: harbor-pilot
+description: Assign sticky dev-server ports, generate and validate harbor.toml configs, and register projects into ~/.harbor — fully standalone, with or without the Harbor app running. Use whenever the user wants to add/register a project to Harbor, create or fix a harbor.toml or .harbor.toml, declare processes/ports/port claims, or asks about avoiding port conflicts between their local projects while configuring one — even if they just say "接入 harbor"、"写个 harbor 配置"、"把这个项目加到 Harbor".
 ---
 
-# Harbor: generate harbor.toml
+# Harbor Pilot: assign ports, write & register harbor.toml
 
-Harbor is a macOS menubar app that supervises per-project dev processes
-declared in a `harbor.toml` (or `.harbor.toml`) at the project root. This
-skill produces configs the real parser accepts (Harbor **1.2.0**), plans
-sticky ports from Harbor's port pool so multiple projects don't collide, and
-**registers the project** in Harbor's registry.
+Harbor Pilot is a **standalone agent skill** for planning dev-server ports
+and registering projects in Harbor's convention. It produces configs the
+real Harbor parser accepts (Harbor **1.2.0**), hands out sticky ports from
+the port pool so multiple projects don't collide, and **registers the
+project** by writing Harbor's registry itself.
+
+**No app required.** The Harbor menubar app and `harbor-tui` are optional
+consumers: they only read (and watch) the same files. Everything this skill
+does — port planning, validation, registration — works with no Harbor
+process running, and `register_project.py` creates `~/.harbor` on demand
+(pool defaults to 8100–8199, registry starts empty).
 
 Harbor's on-disk state is the hidden `~/.harbor` folder:
 
@@ -18,8 +24,8 @@ Harbor's on-disk state is the hidden `~/.harbor` folder:
 ~/.harbor/port-pool.json   # { "ranges": [{ "from": 8100, "to": 8199 }] } (skill reads only)
 ```
 
-The app and TUI only read (and watch) these files, so registration works
-whether or not any Harbor frontend is running.
+Pre-1.2 stores under `~/Library/Application Support/Harbor/` are honored by
+reads and migrated into `~/.harbor` automatically on first registration.
 
 ## Workflow
 

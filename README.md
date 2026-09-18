@@ -1,22 +1,22 @@
-# harbor-toml
+# harbor-pilot
 
-Cursor agent skill for [Harbor](https://github.com/z1joey/harbor) **1.2.0** — drafts and validates `harbor.toml` configs from your repo layout, **registers sticky ports from Harbor's port pool**, plans claims across registered projects, and **registers the project in Harbor's registry** (`~/.harbor`).
+A **standalone agent skill** (Cursor & friends) for [Harbor](https://github.com/z1joey/harbor) **1.2.0** — drafts and validates `harbor.toml` configs from your repo layout, **assigns sticky ports from Harbor's port pool**, plans claims across registered projects, and **registers the project in `~/.harbor`**.
 
-Harbor 1.2.0 stores its state in the hidden `~/.harbor` folder (`projects.json` + `port-pool.json`); the app only reads and watches those files, so this skill works whether or not Harbor is running. Managed servers get a durable `port = N` from the pool (default **8100–8199**); Harbor injects `$PORT` at start; the skill picks the number.
+**Works without the app.** All state lives in the hidden `~/.harbor` folder (`projects.json` + `port-pool.json`); the Harbor app and `harbor-tui` are optional consumers that only read and watch those files. With no `~/.harbor` yet, `register_project.py` creates it (pool defaults **8100–8199**, registry starts empty). Managed servers get a durable `port = N`; Harbor injects `$PORT` at start when it launches them — the skill picks the number either way.
 
 ## Install
 
 ```bash
 mkdir -p ~/.agents/skills
-git clone https://github.com/z1joey/harbor-toml.git ~/.agents/skills/harbor-toml
+git clone https://github.com/z1joey/harbor-pilot.git ~/.agents/skills/harbor-pilot
 ```
 
-In Cursor chat, attach or invoke the **harbor-toml** skill and ask e.g. *"接入 harbor，帮我写个 harbor 配置"* or *"Add `~/Projects/my-app` to Harbor — write harbor.toml"*.
+In Cursor chat, attach or invoke the **harbor-pilot** skill and ask e.g. *"接入 harbor，帮我写个 harbor 配置"* or *"Add `~/Projects/my-app` to Harbor — write harbor.toml"*.
 
 ## Next free pool port
 
 ```bash
-python3 ~/.agents/skills/harbor-toml/scripts/next_pool_port.py \
+python3 ~/.agents/skills/harbor-pilot/scripts/next_pool_port.py \
   --lsof \
   --projects-json \
   path/to/other-project/harbor.toml
@@ -27,15 +27,15 @@ Prints the next free port in the configured pool, skipping process `port` and `p
 ## Register a project
 
 ```bash
-python3 ~/.agents/skills/harbor-toml/scripts/register_project.py ~/Projects/my-app
+python3 ~/.agents/skills/harbor-pilot/scripts/register_project.py ~/Projects/my-app
 ```
 
-Appends the folder to `~/.harbor/projects.json` (idempotent, atomic) after checking a `harbor.toml` exists there. A running Harbor app/TUI picks the project up within a second; no in-app "Add Project" step exists anymore.
+Appends the folder to `~/.harbor/projects.json` (idempotent, atomic, creates `~/.harbor` on demand) after checking a `harbor.toml` exists there. A running Harbor app/TUI picks the project up within a second; with nothing running it simply appears at next launch.
 
 ## Validate without the app
 
 ```bash
-python3 ~/.agents/skills/harbor-toml/scripts/validate_harbor_toml.py \
+python3 ~/.agents/skills/harbor-pilot/scripts/validate_harbor_toml.py \
   path/to/harbor.toml \
   path/to/other-project/harbor.toml
 ```
@@ -56,4 +56,4 @@ Pass every registered project's config to catch static port overlaps. Exit `0` =
 | `scripts/validate_harbor_toml.py` | Parser-aligned validator + overlap checks + pool warnings |
 | `scripts/test_port_pool.py` | Unit + CLI tests for all of the above |
 
-The skill writes `harbor.toml` in the project and `~/.harbor/projects.json` for registration; it never touches `port-pool.json` (users edit that in the app). Pre-1.2 stores under `~/Library/Application Support/Harbor/` are migrated automatically on first registration (and by the app at launch).
+The skill writes `harbor.toml` in the project and `~/.harbor/projects.json` for registration; it never touches `port-pool.json` (users edit that in the app's Port Convention). Pre-1.2 stores under `~/Library/Application Support/Harbor/` are honored by reads and migrated automatically on first registration (and by the app at launch).
