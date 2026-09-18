@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
-"""Validate harbor.toml configs the way Harbor's Swift parser does, plus
-cross-project port-overlap checks.
+"""Validate harbor.toml configs the way Harbor 1.1.0's parser does, plus
+cross-project port-overlap checks and optional pool warnings.
 
 Usage:
-    python3 validate_harbor_toml.py PROJECT/harbor.toml [OTHER/harbor.toml ...]
+    python3 validate_harbor_toml.py [--pool PATH] PROJECT/harbor.toml [OTHER/harbor.toml ...]
 
-Exit codes: 0 = ok, 1 = problems found, 2 = cannot run (missing TOML lib).
+Exit codes: 0 = ok, 1 = errors/overlaps, 2 = cannot run (missing TOML lib / usage).
 
 This script never spawns processes; live listening ports are checked
 separately with `lsof -nP -iTCP -sTCP:LISTEN +c0` (see SKILL.md).
 """
 
+from __future__ import annotations
+
 import os
 import re
 import sys
 
-PORT_MIN, PORT_MAX = 1, 65535
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from harbor_pool import (  # noqa: E402
+    DEFAULT_POOL_PATH,
+    PORT_MAX,
+    PORT_MIN,
+    PoolError,
+    load_port_pool,
+    port_in_pool,
+)
+
 PORT_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # user:pass@localhost in env often means docker-compose was copied into harbor.toml.
 DOCKERISH_LOCAL_DB_RE = re.compile(
@@ -41,7 +55,17 @@ def is_str(value):
     return isinstance(value, str)
 
 
-def check_process(path, index, entry, errors):
+def command_references_port(command, port, env_name):
+    if f"${env_name}" in command or f"${{{env_name}}}" in command:
+        return True
+    return re.search(rf"(?<!\d){port}(?!\d)", command) is not None
+
+
+def command_uses_port_env(command, env_name):
+    return f"${env_name}" in command or f"${{{env_name}}}" in command
+
+
+def check_process(path, index, entry, errors, warnings, pool_ranges):
     label = f"process[{index}]"
     name = entry.get("name")
     if not is_str(name) or not name.strip():
@@ -54,27 +78,47 @@ def check_process(path, index, entry, errors):
         errors.append(f"{path}: {label} needs a non-empty string \"command\".")
 
     port = entry.get("port")
-    auto_port = False
+    has_port = False
     if port is not None:
         if isinstance(port, int) and not isinstance(port, bool):
             if not PORT_MIN <= port <= PORT_MAX:
-                errors.append(f"{path}: {label} port must be an integer in {PORT_MIN}-{PORT_MAX}.")
+                errors.append(
+                    f"{path}: {label} port must be an integer in {PORT_MIN}-{PORT_MAX}."
+                )
+            else:
+                has_port = True
         elif is_str(port) and port == "auto":
-            auto_port = True
+            errors.append(
+                f"{path}: {label} port = \"auto\" is not allowed; "
+                "register a sticky pool port (port = N) — see SKILL.md."
+            )
             port = None
         elif is_str(port):
-            errors.append(f"{path}: {label} port must be an integer or \"auto\", not {port!r}.")
+            errors.append(
+                f"{path}: {label} port must be an integer in {PORT_MIN}-{PORT_MAX}, not {port!r}."
+            )
+            port = None
         else:
-            errors.append(f"{path}: {label} port must be an integer or \"auto\".")
+            errors.append(
+                f"{path}: {label} port must be an integer in {PORT_MIN}-{PORT_MAX}."
+            )
+            port = None
 
     port_env = entry.get("port_env")
+    env_name = "PORT"
     if port_env is not None:
-        if not auto_port:
-            errors.append(f"{path}: {label} port_env is only allowed when port = \"auto\".")
+        if not has_port:
+            errors.append(
+                f"{path}: {label} port_env is only allowed when port is a declared integer."
+            )
         elif not is_str(port_env) or not port_env.strip():
             errors.append(f"{path}: {label} port_env must be a non-empty string.")
         elif not PORT_ENV_RE.match(port_env):
-            errors.append(f"{path}: {label} port_env {port_env!r} is not a valid environment variable name.")
+            errors.append(
+                f"{path}: {label} port_env {port_env!r} is not a valid environment variable name."
+            )
+        else:
+            env_name = port_env
     elif "port_env" in entry:
         errors.append(f"{path}: {label} port_env must be a string.")
 
@@ -83,18 +127,27 @@ def check_process(path, index, entry, errors):
         if not is_str(ready_url):
             errors.append(f"{path}: {label} ready_url must be a string.")
         else:
-            if "${port}" in ready_url and not auto_port:
+            if "${port}" in ready_url and not has_port:
                 errors.append(
-                    f"{path}: {label} ready_url uses ${{port}} but port is not \"auto\"."
+                    f"{path}: {label} ready_url uses ${{port}} but no integer port is declared."
                 )
             validate_url = ready_url.replace("${port}", "1")
             if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", validate_url):
-                errors.append(f"{path}: {label} ready_url {ready_url!r} must be a URL with a scheme.")
+                errors.append(
+                    f"{path}: {label} ready_url {ready_url!r} must be a URL with a scheme."
+                )
 
-    if auto_port and is_str(command):
-        env_name = port_env if is_str(port_env) and port_env else "PORT"
-        if f"${env_name}" not in command and f"${{{env_name}}}" not in command:
-            print(f"WARN     {path}: {label} port = \"auto\" but command does not reference ${env_name}.")
+    if has_port and is_str(command):
+        if not command_references_port(command, port, env_name):
+            warnings.append(
+                f"{path}: {label} port {port} is not referenced in command "
+                f"(${env_name} or {port})."
+            )
+        if pool_ranges is not None and command_uses_port_env(command, env_name) and not port_in_pool(port, pool_ranges):
+            warnings.append(
+                f"{path}: {label} port {port} is outside the Harbor pool; "
+                "managed servers that take $PORT should register the next free pool port."
+            )
 
     if "auto_restart" in entry and not isinstance(entry["auto_restart"], bool):
         errors.append(f"{path}: {label} auto_restart must be a boolean.")
@@ -106,9 +159,11 @@ def check_process(path, index, entry, errors):
         else:
             for key, value in env.items():
                 if not isinstance(value, (str, int, bool)):
-                    errors.append(f"{path}: {label} env {key!r} must be a string, int, or boolean.")
+                    errors.append(
+                        f"{path}: {label} env {key!r} must be a string, int, or boolean."
+                    )
 
-    return name, port
+    return name, port if has_port else None
 
 
 def backend_default_database_url(project_root):
@@ -191,7 +246,7 @@ def check_claim(path, index, entry, process_names, taken_ports, errors):
     return port
 
 
-def check_file(path):
+def check_file(path, pool_ranges):
     """Returns (project_name, claimed_ports:set, errors:list, warnings:list)."""
     errors = []
     warnings = []
@@ -214,7 +269,7 @@ def check_file(path):
         if not isinstance(entry, dict):
             errors.append(f"{path}: process[{index}] is not a table.")
             continue
-        parsed = check_process(path, index, entry, errors)
+        parsed = check_process(path, index, entry, errors, warnings, pool_ranges)
         if parsed is None:
             continue
         name, port = parsed
@@ -263,15 +318,51 @@ def check_file(path):
     return (project_name if is_str(project_name) and project_name else None), taken_ports, errors, warnings
 
 
+def parse_cli(argv):
+    pool_path = DEFAULT_POOL_PATH
+    paths = []
+    args = argv[1:]
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        if arg == "--pool":
+            index += 1
+            if index >= len(args):
+                print("ERROR    --pool requires a path", file=sys.stderr)
+                sys.exit(2)
+            pool_path = args[index]
+        elif arg.startswith("--pool="):
+            pool_path = arg.split("=", 1)[1]
+        else:
+            paths.append(arg)
+        index += 1
+    return pool_path, paths
+
+
+def load_pool_for_lint(pool_path, warnings):
+    try:
+        return load_port_pool(pool_path, missing_ok=True)
+    except PoolError as exc:
+        warnings.append(f"could not load port pool ({pool_path}): {exc}")
+        return None
+
+
 def main():
-    if len(sys.argv) < 2:
+    pool_path, paths = parse_cli(sys.argv)
+    if not paths:
         print(__doc__)
         sys.exit(2)
 
-    paths = sys.argv[1:]
-    results = [check_file(path) for path in paths]
+    pool_warnings = []
+    pool_ranges = load_pool_for_lint(pool_path, pool_warnings)
+
+    results = [check_file(path, pool_ranges) for path in paths]
     errors = [error for _, _, errs, _ in results for error in errs]
-    warnings = [warn for _, _, _, warns in results for warn in warns]
+    warnings = list(pool_warnings)
+    warnings.extend(warn for _, _, _, warns in results for warn in warns)
 
     # Cross-project static overlaps: same fixed port claimed by two configs.
     by_port = {}
@@ -292,7 +383,7 @@ def main():
     if not errors and not overlaps:
         print("OK       all checks passed"
               + (f" ({len(results)} config(s))" if len(results) > 1 else ""))
-    sys.exit(1 if errors else 0)
+    sys.exit(1 if errors or overlaps else 0)
 
 
 if __name__ == "__main__":

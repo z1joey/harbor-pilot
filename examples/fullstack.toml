@@ -1,0 +1,29 @@
+name = "shop"
+open_process = "web"
+
+[[process]]
+name = "deps"
+command = "docker compose up postgres redis"   # foreground, so Harbor can stop it
+[[port_claim]]
+port = 5432
+note = "postgres"
+process = "deps"
+[[port_claim]]
+port = 6379
+note = "redis"
+process = "deps"
+
+[[process]]
+name = "api"
+command = "uv run uvicorn app.main:app --reload --port 8001"
+cwd = "backend"
+port = 8001
+ready_url = "http://127.0.0.1:8001/health"
+env = { "DATABASE_URL" = "postgres://localhost/shop" }
+
+[[process]]
+name = "web"
+command = "npm run dev -- --port $PORT"
+cwd = "frontend"
+port = 8100
+ready_url = "http://127.0.0.1:${port}/"
