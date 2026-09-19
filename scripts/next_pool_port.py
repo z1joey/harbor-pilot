@@ -35,9 +35,8 @@ if SCRIPT_DIR not in sys.path:
 from harbor_pool import (  # noqa: E402
     PoolError,
     claimed_ports_from_toml,
-    configs_from_projects_json,
+    configs_from_central_store,
     default_pool_path,
-    default_projects_path,
     live_listen_ports,
     load_port_pool,
     next_free_ports,
@@ -72,15 +71,15 @@ def build_parser():
         help="include live TCP LISTEN ports from lsof as taken",
     )
     parser.add_argument(
-        "--projects-json",
+        "--registered",
         action="store_true",
-        help="also load TOMLs listed in ~/.harbor/projects.json",
+        help="also load every project's central config from ~/.harbor/projects/",
     )
     parser.add_argument(
-        "--projects-json-path",
-        metavar="PATH",
+        "--projects-dir",
+        metavar="DIR",
         default=None,
-        help="load TOMLs from this projects.json instead of the default registry",
+        help="load central configs from this directory instead of ~/.harbor/projects/",
     )
     parser.add_argument(
         "--stdin-taken",
@@ -96,13 +95,13 @@ def build_parser():
     return parser
 
 
-def collect_taken(toml_paths, projects_json, use_lsof, stdin_taken):
+def collect_taken(toml_paths, registered, projects_dir, use_lsof, stdin_taken):
     taken = set()
     configs = []
     for arg in toml_paths:
         configs.append(resolve_toml_arg(arg))
-    if projects_json is not None:
-        configs.extend(configs_from_projects_json(projects_json))
+    if registered or projects_dir is not None:
+        configs.extend(configs_from_central_store(projects_dir))
     seen = set()
     for path in configs:
         real = os.path.abspath(path)
@@ -124,12 +123,10 @@ def main(argv=None):
         print("ERROR    --count must be >= 1", file=sys.stderr)
         return 2
     try:
-        registry = args.projects_json_path
-        if registry is None and args.projects_json:
-            registry = default_projects_path()
         pool = args.pool or default_pool_path()
         ranges = load_port_pool(pool, missing_ok=True)
-        taken = collect_taken(args.tomls, registry, args.lsof, args.stdin_taken)
+        taken = collect_taken(args.tomls, args.registered, args.projects_dir,
+                              args.lsof, args.stdin_taken)
         ports = next_free_ports(ranges, taken, count=args.count)
     except PoolError as exc:
         print(f"ERROR    {exc}", file=sys.stderr)
