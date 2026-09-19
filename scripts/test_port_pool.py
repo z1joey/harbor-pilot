@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for Harbor 1.1.0 pool helpers, next_pool_port.py, and the validator."""
+"""Tests for Harbor 1.3.0 central-store helpers, the CLIs, and the validator."""
 
 from __future__ import annotations
 
@@ -20,17 +20,20 @@ import harbor_pool  # noqa: E402
 from harbor_pool import (  # noqa: E402
     PoolError,
     claimed_ports_from_data,
+    migrate_legacy_configs,
     migrate_legacy_stores,
     next_free_ports,
     parse_lsof_listen_ports,
     parse_pool_data,
     port_in_pool,
     register_project,
+    unregister_project,
 )
 
 NEXT_POOL = os.path.join(SCRIPTS, "next_pool_port.py")
 VALIDATE = os.path.join(SCRIPTS, "validate_harbor_toml.py")
 REGISTER = os.path.join(SCRIPTS, "register_project.py")
+UNREGISTER = os.path.join(SCRIPTS, "unregister_project.py")
 
 
 def write(path, text):
@@ -40,20 +43,21 @@ def write(path, text):
     return path
 
 
-def run_script(script, args, **kwargs):
+def run_script(script, args, stdin=None, **kwargs):
     env = os.environ.copy()
     env["PYTHONPATH"] = SCRIPTS + os.pathsep + env.get("PYTHONPATH", "")
     return subprocess.run(
         [sys.executable, script, *args],
         capture_output=True,
         text=True,
+        input=stdin,
         env=env,
         **kwargs,
     )
 
 
 SAMPLE_PROCESS = """
-name = "{name}"
+root = "{root}"
 
 [[process]]
 name = "web"
@@ -126,6 +130,7 @@ class HarborHomeTests(unittest.TestCase):
         self.assertTrue(harbor_pool.HARBOR_DIR.endswith("/.harbor"))
         self.assertEqual(harbor_pool.DEFAULT_POOL_PATH, os.path.join(harbor_pool.HARBOR_DIR, "port-pool.json"))
         self.assertEqual(harbor_pool.DEFAULT_PROJECTS_JSON, os.path.join(harbor_pool.HARBOR_DIR, "projects.json"))
+        self.assertEqual(harbor_pool.PROJECTS_DIR, os.path.join(harbor_pool.HARBOR_DIR, "projects"))
 
     def test_fallback_to_legacy_while_only_legacy_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -172,54 +177,212 @@ class HarborHomeTests(unittest.TestCase):
                 self.assertEqual(json.load(fh), ["/fresh"])
 
 
-class RegisterProjectTests(unittest.TestCase):
-    def make_project(self, tmp, name="web"):
-        project = os.path.join(tmp, name)
-        write(os.path.join(project, "harbor.toml"), SAMPLE_PROCESS.format(name=name, port=8100))
-        return project
+class CentralConfigMigrationTests(unittest.TestCase):
+    """Root harbor.toml files are imported into ~/.harbor/projects/ once."""
 
-    def test_registers_into_explicit_registry(self):
+    def test_imports_root_configs_with_root_key_injected(self):
         with tempfile.TemporaryDirectory() as tmp:
-            project = self.make_project(tmp)
-            registry = os.path.join(tmp, ".harbor", "projects.json")
-            self.assertEqual(register_project(project, projects_path=registry), "registered")
-            with open(registry, encoding="utf-8") as fh:
-                self.assertEqual(json.load(fh), [project])
+            root = os.path.join(tmp, "steward")
+            write(os.path.join(root, "harbor.toml"), SAMPLE_PROCESS.format(root="/ignored", port=8100))
+            registry = write(os.path.join(tmp, "projects.json"), json.dumps([root]))
+            projects_dir = os.path.join(tmp, "central")
 
-    def test_registration_is_idempotent_and_normalizes_entries(self):
+            migrate_legacy_configs(projects_dir=projects_dir, registry_path=registry)
+
+            installed = os.path.join(projects_dir, "steward.toml")
+            self.assertTrue(os.path.isfile(installed))
+            with open(installed, encoding="utf-8") as fh:
+                content = fh.read()
+            self.assertIn(f'root = "{root}"', content)
+            self.assertIn('name = "web"', content)
+            # Filename fell back to the root folder name (no `name` key in the TOML).
+            self.assertEqual(os.path.basename(installed), "steward.toml")
+            # The root-side file is never modified or deleted.
+            self.assertTrue(os.path.isfile(os.path.join(root, "harbor.toml")))
+            self.assertTrue(os.path.isfile(registry))
+
+    def test_uses_dot_harbor_toml_flavor_and_folder_name_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
-            project = self.make_project(tmp)
-            registry = write(os.path.join(tmp, "projects.json"), json.dumps([project + "/"]))
-            self.assertEqual(register_project(project, projects_path=registry), "already-registered")
-            with open(registry, encoding="utf-8") as fh:
-                # No-op registration leaves the skill-owned file untouched.
-                self.assertEqual(json.load(fh), [project + "/"])
+            root = os.path.join(tmp, "wordlist-fullstack")
+            write(os.path.join(root, ".harbor.toml"), """
+            [[process]]
+            name = "app"
+            command = "docker compose up --build"
+            """)
+            registry = write(os.path.join(tmp, "projects.json"), json.dumps([root]))
+            projects_dir = os.path.join(tmp, "central")
 
-    def test_registration_requires_config_first(self):
+            migrate_legacy_configs(projects_dir=projects_dir, registry_path=registry)
+
+            installed = os.path.join(projects_dir, "wordlist-fullstack.toml")
+            self.assertTrue(os.path.isfile(installed))
+            with open(installed, encoding="utf-8") as fh:
+                self.assertIn(f'root = "{root}"', fh.read())
+
+    def test_existing_central_files_win_and_import_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "shop")
+            write(os.path.join(root, "harbor.toml"), SAMPLE_PROCESS.format(root="/ignored", port=8100))
+            registry = write(os.path.join(tmp, "projects.json"), json.dumps([root]))
+            projects_dir = os.path.join(tmp, "central")
+            write(os.path.join(projects_dir, "already.toml"), f'root = "{root}"\nname = "already-here"\n')
+
+            migrate_legacy_configs(projects_dir=projects_dir, registry_path=registry)
+            self.assertEqual(os.listdir(projects_dir), ["already.toml"])
+            migrate_legacy_configs(projects_dir=projects_dir, registry_path=registry)
+            self.assertEqual(os.listdir(projects_dir), ["already.toml"])
+
+    def test_root_without_config_is_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
             empty = os.path.join(tmp, "empty")
             os.makedirs(empty)
-            with self.assertRaises(PoolError):
-                register_project(empty, projects_path=os.path.join(tmp, "projects.json"))
+            registry = write(os.path.join(tmp, "projects.json"), json.dumps([empty]))
+            projects_dir = os.path.join(tmp, "central")
 
-    def test_registration_rejects_traversal_and_relative_paths(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            registry = os.path.join(tmp, "projects.json")
-            with self.assertRaises(PoolError):
-                register_project(os.path.join(tmp, "a", "..", "b"), projects_path=registry)
-            with self.assertRaises(PoolError):
-                register_project("relative/path", projects_path=registry)
+            migrate_legacy_configs(projects_dir=projects_dir, registry_path=registry)
+
+            self.assertEqual(os.listdir(projects_dir), [])
+
+
+class RegisterProjectTests(unittest.TestCase):
+    """register_project installs the central config; no root harbor.toml needed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = self._tmp.name
+        self.projects_dir = os.path.join(self.tmp, "central")
+        self.root = os.path.join(self.tmp, "shop")
+        os.makedirs(self.root)
+        self.draft = write(os.path.join(self.tmp, "draft.toml"),
+                           SAMPLE_PROCESS.format(root="/ignored", port=8100))
+
+    def central(self):
+        return os.listdir(self.projects_dir) if os.path.isdir(self.projects_dir) else []
+
+    def test_register_from_config_file(self):
+        result = register_project(self.root, config_path=self.draft,
+                                  projects_dir=self.projects_dir)
+        self.assertEqual(result, "registered")
+        self.assertEqual(self.central(), ["shop.toml"])
+        with open(os.path.join(self.projects_dir, "shop.toml"), encoding="utf-8") as fh:
+            content = fh.read()
+        self.assertIn(f'root = "{self.root}"', content)
+        self.assertNotIn("/ignored", content)
+
+    def test_register_from_stdin_without_root_config(self):
+        stdin_text = SAMPLE_PROCESS.format(root="/ignored", port=8100)
+        with unittest.mock.patch.object(sys, "stdin", io_string(stdin_text)):
+            result = register_project(self.root, projects_dir=self.projects_dir)
+        self.assertEqual(result, "registered")
+        self.assertEqual(self.central(), ["shop.toml"])
+
+    def test_re_registering_is_updated_then_unchanged(self):
+        first = register_project(self.root, config_path=self.draft,
+                                 projects_dir=self.projects_dir)
+        self.assertEqual(first, "registered")
+        same = register_project(self.root, config_path=self.draft,
+                                projects_dir=self.projects_dir)
+        self.assertEqual(same, "unchanged")
+        self.assertEqual(self.central(), ["shop.toml"])
+
+        changed = write(os.path.join(self.tmp, "draft2.toml"),
+                        SAMPLE_PROCESS.format(root="/ignored", port=8101))
+        second = register_project(self.root, config_path=changed,
+                                  projects_dir=self.projects_dir)
+        self.assertEqual(second, "updated")
+        self.assertEqual(self.central(), ["shop.toml"], "update replaces the same file")
+        with open(os.path.join(self.projects_dir, "shop.toml"), encoding="utf-8") as fh:
+            self.assertIn("port = 8101", fh.read())
+
+    def test_register_rejects_bad_structure_and_port_clashes(self):
+        broken = write(os.path.join(self.tmp, "broken.toml"), "name = [oops\n")
+        with self.assertRaises(PoolError):
+            register_project(self.root, config_path=broken, projects_dir=self.projects_dir)
+        self.assertEqual(self.central(), [])
+
+        register_project(self.root, config_path=self.draft, projects_dir=self.projects_dir)
+        clash = write(os.path.join(self.tmp, "clash.toml"),
+                      SAMPLE_PROCESS.format(root="/ignored", port=8100))
+        other = os.path.join(self.tmp, "other")
+        os.makedirs(other)
+        with self.assertRaises(PoolError):
+            register_project(other, config_path=clash, projects_dir=self.projects_dir)
+
+    def test_register_rejects_traversal_relative_and_missing_root(self):
+        traversal = os.path.join(self.tmp, "a", os.pardir, "b")
+        with self.assertRaises(PoolError):
+            register_project(traversal, config_path=self.draft,
+                             projects_dir=self.projects_dir)
+        with self.assertRaises(PoolError):
+            register_project("relative/path", config_path=self.draft,
+                             projects_dir=self.projects_dir)
+        with self.assertRaises(PoolError):
+            register_project(os.path.join(self.tmp, "does-not-exist"),
+                             config_path=self.draft, projects_dir=self.projects_dir)
+        with self.assertRaises(PoolError):
+            register_project(self.root, projects_dir=self.projects_dir)  # no stdin
+
+    def test_register_syncs_projects_json_mirror(self):
+        mirror = os.path.join(self.tmp, "projects.json")
+        register_project(self.root, config_path=self.draft,
+                         projects_dir=self.projects_dir, projects_path=mirror)
+        with open(mirror, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), [self.root])
+
+        unregister_project(self.root, projects_dir=self.projects_dir, projects_path=mirror)
+        with open(mirror, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), [])
+
+    def test_unregister_removes_central_config(self):
+        register_project(self.root, config_path=self.draft, projects_dir=self.projects_dir)
+        self.assertEqual(unregister_project(self.root, projects_dir=self.projects_dir),
+                         "unregistered")
+        self.assertEqual(self.central(), [])
+        self.assertEqual(unregister_project(self.root, projects_dir=self.projects_dir),
+                         "not-registered")
 
     def test_register_cli(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = self.make_project(tmp, name="cli")
-            registry = os.path.join(tmp, "projects.json")
-            result = run_script(REGISTER, [project, "--projects-json-path", registry])
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("REGISTERED", result.stdout)
-            again = run_script(REGISTER, [project, "--projects-json-path", registry])
-            self.assertEqual(again.returncode, 0, again.stderr)
-            self.assertIn("ALREADY-REGISTERED", again.stdout)
+        mirror = os.path.join(self.tmp, "projects.json")
+        result = run_script(REGISTER, [self.root, "--config", self.draft,
+                                       "--projects-dir", self.projects_dir,
+                                       "--projects-json-path", mirror])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REGISTERED", result.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(self.projects_dir, "shop.toml")))
+
+        again = run_script(REGISTER, [self.root, "--config", self.draft,
+                                      "--projects-dir", self.projects_dir,
+                                      "--projects-json-path", mirror])
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("UNCHANGED", again.stdout)
+
+    def test_register_cli_stdin(self):
+        result = run_script(REGISTER, [self.root, "--projects-dir", self.projects_dir],
+                            stdin=SAMPLE_PROCESS.format(root="/ignored", port=8100))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REGISTERED", result.stdout)
+
+    def test_unregister_cli(self):
+        run_script(REGISTER, [self.root, "--config", self.draft,
+                              "--projects-dir", self.projects_dir])
+        result = run_script(UNREGISTER, [self.root, "--projects-dir", self.projects_dir])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("UNREGISTERED", result.stdout)
+        self.assertEqual(self.central(), [])
+
+
+class io_string:
+    """Minimal stdin stand-in exposing isatty() = False and read()."""
+
+    def __init__(self, text):
+        self._text = text
+
+    def isatty(self):
+        return False
+
+    def read(self):
+        return self._text
 
 
 class ScriptTests(unittest.TestCase):
@@ -228,8 +391,9 @@ class ScriptTests(unittest.TestCase):
             pool = write(os.path.join(tmp, "port-pool.json"), """
             { "ranges": [{ "from": 8100, "to": 8199 }] }
             """)
-            sibling = write(os.path.join(tmp, "other", "harbor.toml"), SAMPLE_PROCESS.format(name="other", port=8100))
-            claim = write(os.path.join(tmp, "db", "harbor.toml"), """
+            sibling = write(os.path.join(tmp, "other.toml"), SAMPLE_PROCESS.format(root="/o", port=8100))
+            claim = write(os.path.join(tmp, "db.toml"), """
+            root = "/db"
             name = "db"
             [[process]]
             name = "deps"
@@ -241,15 +405,17 @@ class ScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip().splitlines(), ["8102", "8103"])
 
-    def test_next_pool_port_from_projects_json(self):
+    def test_next_pool_port_from_central_store(self):
         with tempfile.TemporaryDirectory() as tmp:
-            project = os.path.join(tmp, "shop")
-            write(os.path.join(project, "harbor.toml"), SAMPLE_PROCESS.format(name="shop", port=8100))
-            registry = write(os.path.join(tmp, "projects.json"), json.dumps([project]))
+            root = os.path.join(tmp, "shop")
+            os.makedirs(root)
+            projects_dir = os.path.join(tmp, "central")
+            write(os.path.join(projects_dir, "shop.toml"),
+                  SAMPLE_PROCESS.format(root=root, port=8100))
             pool = write(os.path.join(tmp, "port-pool.json"), """
             { "ranges": [{ "from": 8100, "to": 8199 }] }
             """)
-            result = run_script(NEXT_POOL, ["--pool", pool, "--projects-json-path", registry])
+            result = run_script(NEXT_POOL, ["--pool", pool, "--projects-dir", projects_dir])
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "8101")
 
@@ -262,7 +428,7 @@ class ScriptTests(unittest.TestCase):
 
     def test_validate_rejects_auto(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = write(os.path.join(tmp, "harbor.toml"), """
+            path = write(os.path.join(tmp, "draft.toml"), """
             name = "bad"
             [[process]]
             name = "web"
@@ -275,7 +441,7 @@ class ScriptTests(unittest.TestCase):
 
     def test_validate_allows_port_env_and_dollar_port(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = write(os.path.join(tmp, "harbor.toml"), """
+            path = write(os.path.join(tmp, "draft.toml"), """
             name = "ok"
             [[process]]
             name = "api"
@@ -292,17 +458,30 @@ class ScriptTests(unittest.TestCase):
             self.assertIn("OK", result.stdout)
             self.assertNotIn("WARN", result.stdout)
 
+    def test_validate_flags_legacy_root_harbor_toml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "harbor.toml"), """
+            name = "legacy"
+            [[process]]
+            name = "api"
+            command = "run"
+            port = 8100
+            """)
+            result = run_script(VALIDATE, [path])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("no longer read by Harbor 1.3+", result.stdout)
+
     def test_validate_overlap_exits_1(self):
         with tempfile.TemporaryDirectory() as tmp:
-            a = write(os.path.join(tmp, "a", "harbor.toml"), SAMPLE_PROCESS.format(name="a", port=8100))
-            b = write(os.path.join(tmp, "b", "harbor.toml"), SAMPLE_PROCESS.format(name="b", port=8100))
+            a = write(os.path.join(tmp, "a.toml"), SAMPLE_PROCESS.format(root="/a", port=8100))
+            b = write(os.path.join(tmp, "b.toml"), SAMPLE_PROCESS.format(root="/b", port=8100))
             result = run_script(VALIDATE, [a, b])
             self.assertEqual(result.returncode, 1)
             self.assertIn("OVERLAP  port 8100", result.stdout)
 
     def test_validate_warns_out_of_pool_managed_server(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = write(os.path.join(tmp, "harbor.toml"), """
+            path = write(os.path.join(tmp, "draft.toml"), """
             name = "web"
             [[process]]
             name = "web"
@@ -318,7 +497,7 @@ class ScriptTests(unittest.TestCase):
 
     def test_validate_hardcoded_out_of_pool_is_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = write(os.path.join(tmp, "harbor.toml"), """
+            path = write(os.path.join(tmp, "draft.toml"), """
             name = "shop"
             [[process]]
             name = "api"

@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Validate harbor.toml configs the way Harbor 1.1.0's parser does, plus
+"""Validate Harbor config TOMLs the way Harbor 1.3.0's parser does, plus
 cross-project port-overlap checks and optional pool warnings.
 
 Usage:
-    python3 validate_harbor_toml.py [--pool PATH] PROJECT/harbor.toml [OTHER/harbor.toml ...]
+    python3 validate_harbor_toml.py [--pool PATH] DRAFT.toml [OTHER.toml ...]
+
+Since 1.3, configs live in ~/.harbor/projects/<name>.toml (the central
+store); drafts can be any file. A file still named harbor.toml / .harbor.toml
+in a project root is flagged: Harbor no longer reads project roots.
 
 Exit codes: 0 = ok, 1 = errors/overlaps, 2 = cannot run (missing TOML lib / usage).
 
@@ -363,6 +367,13 @@ def main():
     errors = [error for _, _, errs, _ in results for error in errs]
     warnings = list(pool_warnings)
     warnings.extend(warn for _, _, _, warns in results for warn in warns)
+
+    for path in paths:
+        if os.path.basename(path) in ("harbor.toml", ".harbor.toml"):
+            warnings.append(
+                f"{path}: project-root configs are no longer read by Harbor 1.3+ — "
+                "register this config in ~/.harbor/projects/ instead (the root file "
+                "would be safe to git rm)")
 
     # Cross-project static overlaps: same fixed port claimed by two configs.
     by_port = {}

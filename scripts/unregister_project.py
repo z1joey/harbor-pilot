@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
-"""Register a project in Harbor's central store (~/.harbor/projects/).
+"""Unregister a project by removing its central config from ~/.harbor/projects/.
 
 Usage:
-    register_project.py ROOT [--config FILE] [--projects-dir DIR]
-                             [--projects-json-path PATH]
+    unregister_project.py ROOT [--projects-dir DIR] [--projects-json-path PATH]
 
-The central store is the single source of truth — one config TOML per
-project, each carrying `root = "/absolute/path"`. The project root itself
-never needs a harbor.toml. The config comes from --config FILE or a TOML
-draft piped on stdin; a `root` key is injected/updated automatically and the
-draft is validated (structure + cross-project port scan) before the atomic
-install. A running Harbor shows the project within a second — there is no
-"Add Project…" step; with no frontend running it appears at next launch.
+Deleting the config file IS unregistering: Harbor's directory watcher drops
+the project live in both frontends. Nothing on disk inside the project root
+is ever touched. The pre-1.3 projects.json mirror is kept in sync.
 
-The write is idempotent: REGISTERED (new), UPDATED (content changed),
-UNCHANGED (already installed). Exit 0 on any of those; 1 = error; 2 = usage.
+Exit 0 on "unregistered" / "not-registered" (both printed); 1 = error; 2 = usage.
 """
 
 from __future__ import annotations
@@ -28,14 +22,13 @@ if SCRIPT_DIR not in sys.path:
 
 from harbor_pool import (  # noqa: E402
     PoolError,
-    register_project,
+    unregister_project,
 )
 
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
     roots = []
-    config_path = None
     projects_dir = None
     projects_json_path = None
     index = 0
@@ -44,20 +37,15 @@ def main(argv=None):
         if arg in ("-h", "--help"):
             print(__doc__)
             return 0
-        if arg in ("--config", "--projects-dir", "--projects-json-path"):
+        if arg in ("--projects-dir", "--projects-json-path"):
             index += 1
             if index >= len(args):
                 print(f"ERROR    {arg} requires a path", file=sys.stderr)
                 return 2
-            value = args[index]
-            if arg == "--config":
-                config_path = value
-            elif arg == "--projects-dir":
-                projects_dir = value
+            if arg == "--projects-dir":
+                projects_dir = args[index]
             else:
-                projects_json_path = value
-        elif arg.startswith("--config="):
-            config_path = arg.split("=", 1)[1]
+                projects_json_path = args[index]
         elif arg.startswith("--projects-dir="):
             projects_dir = arg.split("=", 1)[1]
         elif arg.startswith("--projects-json-path="):
@@ -72,16 +60,15 @@ def main(argv=None):
         print(__doc__)
         return 2
     try:
-        result = register_project(
+        result = unregister_project(
             roots[0],
-            config_path=config_path,
             projects_dir=projects_dir,
             projects_path=projects_json_path,
         )
     except PoolError as exc:
         print(f"ERROR    {exc}", file=sys.stderr)
         return 1
-    print(f"{result.upper():<10} {os.path.normpath(os.path.expanduser(roots[0]))}")
+    print(f"{result.upper():<14} {os.path.normpath(os.path.expanduser(roots[0]))}")
     return 0
 
 
